@@ -369,7 +369,9 @@ def fake_quantize_tensor_int4(t: Tensor, group_size: int, log_scale: Tensor | No
     if padded_cols != orig_cols:
         dq = dq[:, :orig_cols]
     dq = dq.to(dtype=t.dtype)
-    return t + (dq - t).detach()
+    # Keep the usual STE identity path for the weight tensor while still letting
+    # gradients flow into learned range parameters through the dequantized branch.
+    return dq + (t - t.detach())
 
 def pack_int4_tensor(q: Tensor) -> Tensor:
     q_u4 = torch.bitwise_and(q.to(torch.int16), 0xF).to(torch.uint8)
