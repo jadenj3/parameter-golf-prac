@@ -123,6 +123,33 @@ By default, `train_gpt.py` keeps its ~10 minute wallclock cap. If you want a lon
 
 By default, this command prints `train_loss` step logs during training and prints `val_loss`, `val_bpb`, and compressed model size in the final `final_int8_zlib_roundtrip` lines at the end. If you want periodic validation logs during the run, set `VAL_LOSS_EVERY`, for example `VAL_LOSS_EVERY=200`. For the baseline config, the final `val_bpb` should land around ~1.2 with a compressed model size under 16MB.
 
+### Optional Quantization-Aware Training (CUDA)
+
+`train_gpt.py` now supports a simple final-stage QAT pass inspired by MobileLLM-Pro: group-wise INT4 fake quantization on large weight matrices and embeddings, optional learnable ranges, optional self-distillation from a frozen full-precision teacher, and INT4 export.
+
+Typical workflow:
+
+```bash
+RUN_ID=baseline_fp \
+MAX_WALLCLOCK_SECONDS=0 \
+torchrun --standalone --nproc_per_node=1 train_gpt.py
+
+RUN_ID=baseline_qat \
+INIT_MODEL_PATH=./final_model.pt \
+QAT_ENABLE=1 \
+QAT_LEARNABLE_RANGES=1 \
+QAT_DISTILL_WEIGHT=0.5 \
+EXPORT_QUANT_FORMAT=int4 \
+MAX_WALLCLOCK_SECONDS=0 \
+torchrun --standalone --nproc_per_node=1 train_gpt.py
+```
+
+Useful knobs:
+
+- `QAT_GROUP_SIZE=32` keeps the paper-style group size for INT4 weights.
+- `QAT_TEACHER_PATH=/path/to/fp_checkpoint.pt` overrides the default teacher; if omitted, `INIT_MODEL_PATH` is reused.
+- `EXPORT_QUANT_FORMAT=int8|int4` selects the final artifact format. The default stays `int8` for normal training and switches to `int4` when `QAT_ENABLE=1`.
+
 For dataset export, tokenizer export, and docs-cache rebuild instructions, see [data/README.md](data/README.md).
 
 
