@@ -42,7 +42,6 @@ class Hyperparameters:
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
     tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
-    init_model_path = os.environ.get("INIT_MODEL_PATH", "")
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed = int(os.environ.get("SEED", 1337))
 
@@ -86,15 +85,6 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
-
-    # Optional final-stage quantization-aware training.
-    qat_enable = bool(int(os.environ.get("QAT_ENABLE", "0")))
-    qat_group_size = int(os.environ.get("QAT_GROUP_SIZE", 32))
-    qat_learnable_ranges = bool(int(os.environ.get("QAT_LEARNABLE_RANGES", "1")))
-    qat_distill_weight = float(os.environ.get("QAT_DISTILL_WEIGHT", "0.0"))
-    qat_temperature = float(os.environ.get("QAT_TEMPERATURE", 1.0))
-    qat_teacher_path = os.environ.get("QAT_TEACHER_PATH", "")
-    export_quant_format = os.environ.get("EXPORT_QUANT_FORMAT", "int4" if qat_enable else "int8")
 
 # -----------------------------
 # MUON OPTIMIZER
@@ -299,7 +289,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,qat_log_scale",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
     ).split(",")
     if pattern
 )
@@ -316,12 +306,6 @@ INT8_KEEP_FLOAT_STORE_DTYPE = torch.float16
 INT8_PER_ROW_SCALE_DTYPE = torch.float16
 INT8_CLIP_PERCENTILE = 99.99984
 INT8_CLIP_Q = INT8_CLIP_PERCENTILE / 100.0
-INT4_KEEP_FLOAT_MAX_NUMEL = 65_536
-INT4_SCALE_DTYPE = torch.float16
-INT4_MIN = -8
-INT4_MAX = 7
-INT4_SCALE_DENOM = 7.5
-INT4_SCALE_EPS = 1e-8
 
 def tensor_nbytes(t: Tensor) -> int:
     return int(t.numel()) * int(t.element_size())
@@ -333,57 +317,6 @@ def keep_float_tensor(name: str, t: Tensor, passthrough_orig_dtypes: dict[str, s
         passthrough_orig_dtypes[name] = str(t.dtype).removeprefix("torch.")
         return t.to(dtype=INT8_KEEP_FLOAT_STORE_DTYPE).contiguous()
     return t
-
-def int4_group_layout(cols: int, group_size: int) -> tuple[int, int]:
-    if group_size <= 0 or group_size % 2 != 0:
-        raise ValueError(f"QAT_GROUP_SIZE must be a positive even integer, got {group_size}")
-    padded_cols = cols + ((-cols) % group_size)
-    return padded_cols, padded_cols // group_size
-
-def init_int4_group_scales(t: Tensor, group_size: int) -> Tensor:
-    if t.ndim != 2:
-        raise ValueError(f"INT4 group quantization expects a matrix, got shape {tuple(t.shape)}")
-    t32 = t.detach().float()
-    padded_cols, num_groups = int4_group_layout(t32.shape[1], group_size)
-    if padded_cols != t32.shape[1]:
-        t32 = F.pad(t32, (0, padded_cols - t32.shape[1]))
-    grouped = t32.view(t32.shape[0], num_groups, group_size)
-    clip_abs = grouped.abs().amax(dim=-1).clamp_min(INT4_SCALE_EPS)
-    return (clip_abs / INT4_SCALE_DENOM).clamp_min(INT4_SCALE_EPS)
-
-def fake_quantize_tensor_int4(t: Tensor, group_size: int, log_scale: Tensor | None = None) -> Tensor:
-    if t.ndim != 2 or t.numel() == 0:
-        return t
-    t32 = t.float()
-    orig_cols = t32.shape[1]
-    padded_cols, num_groups = int4_group_layout(orig_cols, group_size)
-    if padded_cols != orig_cols:
-        t32 = F.pad(t32, (0, padded_cols - orig_cols))
-    grouped = t32.view(t32.shape[0], num_groups, group_size)
-    if log_scale is None:
-        scale = (grouped.abs().amax(dim=-1, keepdim=True) / INT4_SCALE_DENOM).clamp_min(INT4_SCALE_EPS)
-    else:
-        scale = log_scale.float().clamp(min=math.log(INT4_SCALE_EPS), max=5.0).exp()[..., None]
-    q = torch.clamp(torch.round(grouped / scale), INT4_MIN, INT4_MAX)
-    dq = (q * scale).view(t32.shape[0], padded_cols)
-    if padded_cols != orig_cols:
-        dq = dq[:, :orig_cols]
-    dq = dq.to(dtype=t.dtype)
-    # Keep the usual STE identity path for the weight tensor while still letting
-    # gradients flow into learned range parameters through the dequantized branch.
-    return dq + (t - t.detach())
-
-def pack_int4_tensor(q: Tensor) -> Tensor:
-    q_u4 = torch.bitwise_and(q.to(torch.int16), 0xF).to(torch.uint8)
-    return (q_u4[..., 0::2] | (q_u4[..., 1::2] << 4)).contiguous()
-
-def unpack_int4_tensor(packed: Tensor) -> Tensor:
-    low = (packed & 0x0F).to(torch.int8)
-    high = ((packed >> 4) & 0x0F).to(torch.int8)
-    q = torch.empty((*packed.shape[:-1], packed.shape[-1] * 2), dtype=torch.int8)
-    q[..., 0::2] = low
-    q[..., 1::2] = high
-    return torch.where(q >= 8, q - 16, q)
 
 def quantize_float_tensor(t: Tensor) -> tuple[Tensor, Tensor]:
     t32 = t.float()
@@ -488,127 +421,6 @@ def dequantize_state_dict_int8(obj: dict[str, object]) -> dict[str, Tensor]:
         out[name] = out_t
     return out
 
-def quantize_float_tensor_int4(
-    t: Tensor,
-    group_size: int,
-    scale_override: Tensor | None = None,
-) -> tuple[Tensor, Tensor]:
-    if t.ndim != 2:
-        raise ValueError(f"INT4 export only supports matrices, got shape {tuple(t.shape)}")
-    t32 = t.float()
-    orig_cols = t32.shape[1]
-    padded_cols, num_groups = int4_group_layout(orig_cols, group_size)
-    if padded_cols != orig_cols:
-        t32 = F.pad(t32, (0, padded_cols - orig_cols))
-    grouped = t32.view(t32.shape[0], num_groups, group_size)
-    if scale_override is None:
-        scale = init_int4_group_scales(t32[:, :orig_cols], group_size)
-    else:
-        scale = scale_override.detach().float().contiguous()
-        if tuple(scale.shape) != (t32.shape[0], num_groups):
-            raise ValueError(
-                f"INT4 scale override shape mismatch for {tuple(t.shape)}: "
-                f"expected {(t32.shape[0], num_groups)}, got {tuple(scale.shape)}"
-            )
-    q = torch.clamp(torch.round(grouped / scale[..., None]), INT4_MIN, INT4_MAX).to(torch.int8)
-    return pack_int4_tensor(q), scale.to(dtype=INT4_SCALE_DTYPE).contiguous()
-
-def quantize_state_dict_int4(
-    state_dict: dict[str, Tensor],
-    group_size: int,
-    scale_overrides: dict[str, Tensor] | None = None,
-):
-    quantized: dict[str, Tensor] = {}
-    scales: dict[str, Tensor] = {}
-    dtypes: dict[str, str] = {}
-    passthrough: dict[str, Tensor] = {}
-    passthrough_orig_dtypes: dict[str, str] = {}
-    qmeta: dict[str, dict[str, object]] = {}
-    stats = dict.fromkeys(
-        ("param_count", "num_tensors", "num_float_tensors", "num_nonfloat_tensors", "baseline_tensor_bytes", "int4_payload_bytes"),
-        0,
-    )
-    scale_overrides = scale_overrides or {}
-
-    for name, tensor in state_dict.items():
-        t = tensor.detach().to("cpu").contiguous()
-        stats["param_count"] += int(t.numel())
-        stats["num_tensors"] += 1
-        stats["baseline_tensor_bytes"] += tensor_nbytes(t)
-
-        if not t.is_floating_point():
-            stats["num_nonfloat_tensors"] += 1
-            passthrough[name] = t
-            stats["int4_payload_bytes"] += tensor_nbytes(t)
-            continue
-
-        if t.ndim != 2 or t.numel() <= INT4_KEEP_FLOAT_MAX_NUMEL:
-            kept = keep_float_tensor(name, t, passthrough_orig_dtypes)
-            passthrough[name] = kept
-            stats["int4_payload_bytes"] += tensor_nbytes(kept)
-            continue
-
-        stats["num_float_tensors"] += 1
-        q, s = quantize_float_tensor_int4(t, group_size, scale_overrides.get(name))
-        quantized[name] = q
-        scales[name] = s
-        dtypes[name] = str(t.dtype).removeprefix("torch.")
-        qmeta[name] = {"scheme": "group_int4", "group_size": group_size, "orig_shape": list(t.shape)}
-        stats["int4_payload_bytes"] += tensor_nbytes(q) + tensor_nbytes(s)
-
-    obj: dict[str, object] = {
-        "__quant_format__": "int4_clean_group_v1",
-        "quantized": quantized,
-        "scales": scales,
-        "dtypes": dtypes,
-        "passthrough": passthrough,
-        "qmeta": qmeta,
-    }
-    if passthrough_orig_dtypes:
-        obj["passthrough_orig_dtypes"] = passthrough_orig_dtypes
-    return obj, stats
-
-def dequantize_state_dict_int4(obj: dict[str, object]) -> dict[str, Tensor]:
-    out: dict[str, Tensor] = {}
-    passthrough_orig_dtypes = obj.get("passthrough_orig_dtypes", {})
-    for name, packed in obj["quantized"].items():
-        dtype = getattr(torch, obj["dtypes"][name])
-        meta = obj["qmeta"][name]
-        orig_rows, orig_cols = meta["orig_shape"]
-        scale = obj["scales"][name].to(dtype=torch.float32)
-        q = unpack_int4_tensor(packed.to(dtype=torch.uint8))
-        dq = (q.float() * scale[..., None]).view(orig_rows, -1)[:, :orig_cols]
-        out[name] = dq.to(dtype=dtype).contiguous()
-    for name, t in obj["passthrough"].items():
-        out_t = t.detach().to("cpu").contiguous()
-        orig_dtype = passthrough_orig_dtypes.get(name)
-        if isinstance(orig_dtype, str):
-            out_t = out_t.to(dtype=getattr(torch, orig_dtype)).contiguous()
-        out[name] = out_t
-    return out
-
-def dequantize_state_dict(obj: dict[str, object]) -> dict[str, Tensor]:
-    quant_format = obj.get("__quant_format__")
-    if quant_format == "int8_clean_per_row_v1":
-        return dequantize_state_dict_int8(obj)
-    if quant_format == "int4_clean_group_v1":
-        return dequantize_state_dict_int4(obj)
-    raise ValueError(f"Unsupported quantized state_dict format: {quant_format}")
-
-def load_state_dict_from_path(path: str) -> dict[str, Tensor]:
-    if not path:
-        raise ValueError("path must be non-empty")
-    load_path = Path(path)
-    if load_path.suffix == ".ptz":
-        loaded = torch.load(io.BytesIO(zlib.decompress(load_path.read_bytes())), map_location="cpu")
-    else:
-        loaded = torch.load(load_path, map_location="cpu")
-    if isinstance(loaded, dict) and "__quant_format__" in loaded:
-        return dequantize_state_dict(loaded)
-    if not isinstance(loaded, dict):
-        raise TypeError(f"Expected a state_dict-like object in {path}, got {type(loaded)!r}")
-    return loaded
-
 
 # -----------------------------
 # DATA LOADING
@@ -696,41 +508,16 @@ class RMSNorm(nn.Module):
 
 class CastedLinear(nn.Linear):
     # Keep weights in fp32 for optimizer/state quality, cast at matmul time for bf16 compute.
-    def __init__(self, in_features: int, out_features: int, bias: bool = False):
-        super().__init__(in_features, out_features, bias=bias)
-        self.qat_enabled = False
-        self.qat_group_size = 0
-        self.register_parameter("qat_log_scale", None)
-
-    def enable_qat(self, group_size: int, learnable_ranges: bool) -> None:
-        self.qat_enabled = True
-        self.qat_group_size = group_size
-        if learnable_ranges:
-            init = init_int4_group_scales(self.weight.detach(), group_size).log()
-            self.qat_log_scale = nn.Parameter(init)
-
-    def set_qat_enabled(self, enabled: bool) -> None:
-        self.qat_enabled = enabled
-
-    def quantized_weight(self) -> Tensor:
-        if not self.qat_enabled:
-            return self.weight
-        return fake_quantize_tensor_int4(self.weight, self.qat_group_size, self.qat_log_scale)
-
     def forward(self, x: Tensor) -> Tensor:
         bias = self.bias.to(x.dtype) if self.bias is not None else None
-        return F.linear(x, self.quantized_weight().to(x.dtype), bias)
+        return F.linear(x, self.weight.to(x.dtype), bias)
 
 
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     # Keep small/control parameters in fp32 even when the model body runs in bf16.
     with torch.no_grad():
         for name, param in module.named_parameters():
-            if (
-                param.ndim < 2
-                or "qat_log_scale" in name
-                or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
-            ) and param.dtype != torch.float32:
+            if (param.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)) and param.dtype != torch.float32:
                 param.data = param.data.float()
 
 
@@ -879,10 +666,7 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
-        self.qat_enabled = False
-        self.qat_group_size = 0
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.register_parameter("tok_emb_qat_log_scale", None)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -913,42 +697,8 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def enable_qat(self, group_size: int, learnable_ranges: bool) -> None:
-        self.qat_enabled = True
-        self.qat_group_size = group_size
-        if learnable_ranges:
-            init = init_int4_group_scales(self.tok_emb.weight.detach(), group_size).log()
-            self.tok_emb_qat_log_scale = nn.Parameter(init)
-        for module in self.modules():
-            if isinstance(module, CastedLinear):
-                module.enable_qat(group_size, learnable_ranges)
-
-    def set_qat_enabled(self, enabled: bool) -> None:
-        self.qat_enabled = enabled
-        for module in self.modules():
-            if isinstance(module, CastedLinear):
-                module.set_qat_enabled(enabled)
-
-    def export_state_dict(self) -> dict[str, Tensor]:
-        return {name: tensor for name, tensor in self.state_dict().items() if "qat_log_scale" not in name}
-
-    def qat_scale_overrides(self) -> dict[str, Tensor]:
-        overrides: dict[str, Tensor] = {}
-        if self.qat_enabled and self.tok_emb_qat_log_scale is not None:
-            overrides["tok_emb.weight"] = self.tok_emb_qat_log_scale.detach().float().exp().cpu()
-        for name, module in self.named_modules():
-            if isinstance(module, CastedLinear) and module.qat_log_scale is not None:
-                overrides[f"{name}.weight"] = module.qat_log_scale.detach().float().exp().cpu()
-        return overrides
-
-    def token_embedding_weight(self) -> Tensor:
-        if not self.qat_enabled:
-            return self.tok_emb.weight
-        return fake_quantize_tensor_int4(self.tok_emb.weight, self.qat_group_size, self.tok_emb_qat_log_scale)
-
-    def forward_logits(self, input_ids: Tensor) -> Tensor:
-        tok_emb_weight = self.token_embedding_weight()
-        x = F.embedding(input_ids, tok_emb_weight)
+    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+        x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
@@ -963,31 +713,15 @@ class GPT(nn.Module):
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
+        targets = target_ids.reshape(-1)
         if self.tie_embeddings:
-            logits_proj = F.linear(x, tok_emb_weight)
+            logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
-        return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-
-    def forward(
-        self,
-        input_ids: Tensor,
-        target_ids: Tensor,
-        teacher_logits: Tensor | None = None,
-        kd_weight: float = 0.0,
-        temperature: float = 1.0,
-    ) -> Tensor:
-        logits = self.forward_logits(input_ids)
-        targets = target_ids.reshape(-1)
-        ce_loss = F.cross_entropy(logits.float(), targets, reduction="mean")
-        if teacher_logits is None or kd_weight <= 0.0:
-            return ce_loss
-        student_log_probs = F.log_softmax(logits.float() / temperature, dim=-1)
-        teacher_probs = F.softmax(teacher_logits.float() / temperature, dim=-1)
-        kd_loss = F.kl_div(student_log_probs, teacher_probs, reduction="batchmean") * (temperature * temperature)
-        return (1.0 - kd_weight) * ce_loss + kd_weight * kd_loss
+        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+        return F.cross_entropy(logits.float(), targets, reduction="mean")
 
 
 # -----------------------------
@@ -999,10 +733,6 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    if args.qat_temperature <= 0.0:
-        raise ValueError(f"QAT_TEMPERATURE must be positive, got {args.qat_temperature}")
-    if args.export_quant_format not in {"int8", "int4"}:
-        raise ValueError(f"EXPORT_QUANT_FORMAT must be one of int8/int4, got {args.export_quant_format}")
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1105,46 +835,13 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
-    )
-    if args.init_model_path:
-        base_model.load_state_dict(load_state_dict_from_path(args.init_model_path), strict=True)
-    if args.qat_enable:
-        base_model.enable_qat(args.qat_group_size, args.qat_learnable_ranges)
-    base_model = base_model.to(device).bfloat16()
+    ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    use_compile = not args.qat_enable
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True) if use_compile else base_model
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
-
-    teacher_path = args.qat_teacher_path or (args.init_model_path if args.qat_enable else "")
-    teacher_model: GPT | None = None
-    if args.qat_distill_weight > 0.0:
-        if not teacher_path:
-            raise ValueError("QAT_DISTILL_WEIGHT > 0 requires QAT_TEACHER_PATH or INIT_MODEL_PATH")
-        teacher_model = GPT(
-            vocab_size=args.vocab_size,
-            num_layers=args.num_layers,
-            model_dim=args.model_dim,
-            num_heads=args.num_heads,
-            num_kv_heads=args.num_kv_heads,
-            mlp_mult=args.mlp_mult,
-            tie_embeddings=args.tie_embeddings,
-            tied_embed_init_std=args.tied_embed_init_std,
-            logit_softcap=args.logit_softcap,
-            rope_base=args.rope_base,
-            qk_gain_init=args.qk_gain_init,
-        )
-        teacher_model.load_state_dict(load_state_dict_from_path(teacher_path), strict=True)
-        teacher_model = teacher_model.to(device).bfloat16()
-        for module in teacher_model.modules():
-            if isinstance(module, CastedLinear):
-                module.float()
-        restore_low_dim_params_to_fp32(teacher_model)
-        teacher_model.eval()
-        teacher_model.requires_grad_(False)
 
     # Optimizer split:
     # - token embedding (Adam) uses EMBED_LR
@@ -1155,20 +852,15 @@ def main() -> None:
     matrix_params = [
         p
         for name, p in block_named_params
-        if p.ndim == 2 and "qat_log_scale" not in name and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if p.ndim == 2 and not any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     scalar_params = [
         p
         for name, p in block_named_params
-        if p.ndim < 2 or "qat_log_scale" in name or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
+        if p.ndim < 2 or any(pattern in name for pattern in CONTROL_TENSOR_NAME_PATTERNS)
     ]
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
-    scalar_param_ids = {id(p) for p in scalar_params}
-    for name, param in base_model.named_parameters():
-        if "qat_log_scale" in name and id(param) not in scalar_param_ids:
-            scalar_params.append(param)
-            scalar_param_ids.add(id(param))
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
     optimizer_tok = torch.optim.Adam(
         [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
@@ -1206,17 +898,6 @@ def main() -> None:
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
-        f"qat:enabled={args.qat_enable} format={args.export_quant_format} group_size:{args.qat_group_size} "
-        f"learnable_ranges:{args.qat_learnable_ranges} kd_weight:{args.qat_distill_weight:.3f} "
-        f"temperature:{args.qat_temperature:.3f} compile:{use_compile}"
-    )
-    if args.qat_enable and not args.init_model_path:
-        log0("WARNING: QAT_ENABLE=1 without INIT_MODEL_PATH starts from random init; use a full-precision checkpoint for a true final-stage QAT run.")
-    if args.init_model_path:
-        log0(f"init_model_path:{args.init_model_path}")
-    if teacher_model is not None:
-        log0(f"qat_teacher_path:{teacher_path}")
-    log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
@@ -1237,21 +918,6 @@ def main() -> None:
     def zero_grad_all() -> None:
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
-
-    def forward_train_loss(x: Tensor, y: Tensor) -> Tensor:
-        teacher_logits = None
-        if teacher_model is not None and args.qat_distill_weight > 0.0:
-            with torch.inference_mode():
-                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                    teacher_logits = teacher_model.forward_logits(x)
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-            return model(
-                x,
-                y,
-                teacher_logits=teacher_logits,
-                kd_weight=args.qat_distill_weight,
-                temperature=args.qat_temperature,
-            )
 
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
@@ -1278,7 +944,8 @@ def main() -> None:
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-                warmup_loss = forward_train_loss(x, y)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
             for opt in optimizers:
                 opt.step()
@@ -1345,7 +1012,8 @@ def main() -> None:
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
-            loss = forward_train_loss(x, y)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                loss = model(x, y)
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
@@ -1397,55 +1065,38 @@ def main() -> None:
     # Save the raw state (useful for debugging/loading in PyTorch directly), then always produce
     # the compressed int8+zlib artifact and validate the round-tripped weights.
 
-    scale_overrides = base_model.qat_scale_overrides()
-    if args.qat_enable:
-        base_model.set_qat_enabled(False)
-
-    export_state = base_model.export_state_dict()
     if master_process:
-        torch.save(export_state, "final_model.pt")
+        torch.save(base_model.state_dict(), "final_model.pt")
         model_bytes = os.path.getsize("final_model.pt")
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    if args.export_quant_format == "int4":
-        quant_obj, quant_stats = quantize_state_dict_int4(export_state, args.qat_group_size, scale_overrides)
-        quant_payload_key = "int4_payload_bytes"
-    else:
-        quant_obj, quant_stats = quantize_state_dict_int8(export_state)
-        quant_payload_key = "int8_payload_bytes"
+    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
     quant_blob = zlib.compress(quant_raw, level=9)
     quant_raw_bytes = len(quant_raw)
-    quant_ext = args.export_quant_format
-    quant_path = f"final_model.{quant_ext}.ptz"
     if master_process:
-        with open(quant_path, "wb") as f:
+        with open("final_model.int8.ptz", "wb") as f:
             f.write(quant_blob)
-        quant_file_bytes = os.path.getsize(quant_path)
+        quant_file_bytes = os.path.getsize("final_model.int8.ptz")
         code_bytes = len(code.encode("utf-8"))
-        ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats[quant_payload_key], 1)
+        ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
         log0(
-            f"Serialized model {quant_ext}+zlib: {quant_file_bytes} bytes "
-            f"(payload:{quant_stats[quant_payload_key]} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
+            f"Serialized model int8+zlib: {quant_file_bytes} bytes "
+            f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
         )
-        log0(f"Total submission size {quant_ext}+zlib: {quant_file_bytes + code_bytes} bytes")
+        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
 
     if distributed:
         dist.barrier()
-    with open(quant_path, "rb") as f:
+    with open("final_model.int8.ptz", "rb") as f:
         quant_blob_disk = f.read()
     quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
-    incompatible = base_model.load_state_dict(dequantize_state_dict(quant_state), strict=False)
-    if incompatible.unexpected_keys or any("qat_log_scale" not in key for key in incompatible.missing_keys):
-        raise RuntimeError(
-            f"Unexpected load mismatch after {quant_ext} roundtrip: "
-            f"missing={incompatible.missing_keys} unexpected={incompatible.unexpected_keys}"
-        )
+    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
     torch.cuda.synchronize()
     t_qeval = time.perf_counter()
     q_val_loss, q_val_bpb = eval_val(
@@ -1462,10 +1113,10 @@ def main() -> None:
     )
     torch.cuda.synchronize()
     log0(
-        f"final_{quant_ext}_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
         f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
     )
-    log0(f"final_{quant_ext}_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
