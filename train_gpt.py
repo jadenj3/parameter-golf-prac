@@ -88,10 +88,10 @@ class Hyperparameters:
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
 
     # Optional final-stage quantization-aware training.
-    qat_enable = bool(int(os.environ.get("QAT_ENABLE", "1")))
+    qat_enable = bool(int(os.environ.get("QAT_ENABLE", "0")))
     qat_group_size = int(os.environ.get("QAT_GROUP_SIZE", 32))
     qat_learnable_ranges = bool(int(os.environ.get("QAT_LEARNABLE_RANGES", "1")))
-    qat_distill_weight = float(os.environ.get("QAT_DISTILL_WEIGHT", "0.5" if qat_enable else "0.0"))
+    qat_distill_weight = float(os.environ.get("QAT_DISTILL_WEIGHT", "0.0"))
     qat_temperature = float(os.environ.get("QAT_TEMPERATURE", 1.0))
     qat_teacher_path = os.environ.get("QAT_TEACHER_PATH", "")
     export_quant_format = os.environ.get("EXPORT_QUANT_FORMAT", "int4" if qat_enable else "int8")
@@ -1210,6 +1210,8 @@ def main() -> None:
         f"learnable_ranges:{args.qat_learnable_ranges} kd_weight:{args.qat_distill_weight:.3f} "
         f"temperature:{args.qat_temperature:.3f} compile:{use_compile}"
     )
+    if args.qat_enable and not args.init_model_path:
+        log0("WARNING: QAT_ENABLE=1 without INIT_MODEL_PATH starts from random init; use a full-precision checkpoint for a true final-stage QAT run.")
     if args.init_model_path:
         log0(f"init_model_path:{args.init_model_path}")
     if teacher_model is not None:

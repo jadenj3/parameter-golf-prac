@@ -147,6 +147,7 @@ torchrun --standalone --nproc_per_node=1 train_gpt.py
 Useful knobs:
 
 - `QAT_GROUP_SIZE=32` keeps the paper-style group size for INT4 weights.
+- `QAT_DISTILL_WEIGHT=0.5` turns on teacher-logit distillation; it is off by default.
 - `QAT_TEACHER_PATH=/path/to/fp_checkpoint.pt` overrides the default teacher; if omitted, `INIT_MODEL_PATH` is reused.
 - `EXPORT_QUANT_FORMAT=int8|int4` selects the final artifact format. The default stays `int8` for normal training and switches to `int4` when `QAT_ENABLE=1`.
 
