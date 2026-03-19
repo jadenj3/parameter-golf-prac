@@ -69,6 +69,16 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
+    embedding_type = os.environ.get("EMBEDDING_TYPE", "standard")
+    spelling_bee_separate_token_embedding = bool(
+        int(os.environ.get("SPELLING_BEE_SEPARATE_TOKEN_EMBEDDING", "1"))
+    )
+    spelling_bee_max_characters = int(os.environ.get("SPELLING_BEE_MAX_CHARACTERS", 32))
+    spelling_bee_character_norm = bool(int(os.environ.get("SPELLING_BEE_CHARACTER_NORM", "1")))
+    spelling_bee_char_init_scale = float(os.environ.get("SPELLING_BEE_CHAR_INIT_SCALE", 1.0))
+    spelling_bee_apply_rotary = bool(int(os.environ.get("SPELLING_BEE_APPLY_ROTARY", "1")))
+    spelling_bee_scale = float(os.environ.get("SPELLING_BEE_SCALE", 1.0))
+    spelling_bee_type = os.environ.get("SPELLING_BEE_TYPE", "full")
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -552,6 +562,146 @@ def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
 
 
+class SpellingBeeEmbedding(nn.Module):
+    # Compose token embeddings from byte spellings with a fixed RoPE over byte position.
+    def __init__(
+        self,
+        num_tokens: int,
+        embedding_dim: int,
+        vocab: list[str],
+        separate_token_embedding: bool,
+        max_characters: int = 32,
+        character_norm: bool = True,
+        char_init_scale: float = 1.0,
+        apply_rotary: bool = True,
+        scale: float = 1.0,
+        spelling_type: str = "full",
+        rotary_base: float = 10000.0,
+    ):
+        super().__init__()
+        if len(vocab) != num_tokens:
+            raise ValueError(f"expected {num_tokens} vocab entries, got {len(vocab)}")
+        if max_characters <= 0:
+            raise ValueError(f"max_characters must be positive, got {max_characters}")
+        if spelling_type not in {"full", "dummy", "shuffled", "double", "static_emb"}:
+            raise ValueError(f"unsupported SPELLING_BEE_TYPE={spelling_type}")
+
+        self.num_embeddings = num_tokens
+        self.embedding_dim = embedding_dim
+        self.max_characters_per_token = max_characters
+        self.separate_token_embedding = separate_token_embedding
+        self.character_norm = character_norm
+        self.char_init_scale = char_init_scale
+        self.apply_rotary = apply_rotary
+        self.scale = scale
+        self.spelling_type = spelling_type
+        self.rotary_dim = embedding_dim - (embedding_dim % 2)
+
+        if separate_token_embedding:
+            self.token_embedding = nn.Embedding(num_tokens, embedding_dim)
+        else:
+            self.token_embedding = None
+        if spelling_type == "double":
+            self.token_embedding_2 = nn.Embedding(num_tokens, embedding_dim)
+        else:
+            self.token_embedding_2 = None
+        if spelling_type == "static_emb":
+            self.aux_embedding = nn.Parameter(torch.empty(embedding_dim))
+        else:
+            self.aux_embedding = None
+        if spelling_type in {"full", "dummy", "shuffled"}:
+            self.character_embedding = nn.Embedding(256, embedding_dim)
+        else:
+            self.character_embedding = None
+        self.rotary = Rotary(self.rotary_dim, base=rotary_base) if apply_rotary and self.rotary_dim > 0 else None
+
+        table, mask, num_clipped = self._build_character_table(vocab)
+        self.register_buffer("vocab_character_table", table, persistent=True)
+        self.register_buffer("vocab_character_mask", mask, persistent=True)
+        if num_clipped > 0:
+            print(f"Warning: clipped {num_clipped} tokens to {self.max_characters_per_token} characters")
+
+    def _build_character_table(self, vocab: list[str]) -> tuple[Tensor, Tensor, int]:
+        table = torch.zeros((self.num_embeddings, self.max_characters_per_token), dtype=torch.int32)
+        mask = torch.zeros((self.num_embeddings, self.max_characters_per_token), dtype=torch.bool)
+        if self.spelling_type in {"dummy", "double", "static_emb"}:
+            return table, mask, 0
+
+        vocab_bytes = [token.encode("utf-8") for token in vocab]
+        if self.spelling_type == "shuffled":
+            vocab_bytes = random.Random(4253217).sample(vocab_bytes, len(vocab_bytes))
+
+        num_clipped = 0
+        for token_idx, token_bytes in enumerate(vocab_bytes):
+            if len(token_bytes) > self.max_characters_per_token:
+                num_clipped += 1
+            if not token_bytes:
+                continue
+            limit = min(len(token_bytes), self.max_characters_per_token)
+            table[token_idx, :limit] = torch.tensor(list(token_bytes[:limit]), dtype=torch.int32)
+            mask[token_idx, :limit] = True
+        return table, mask, num_clipped
+
+    def init_weights(self, token_init_std: float) -> None:
+        if self.token_embedding is not None:
+            nn.init.normal_(self.token_embedding.weight, mean=0.0, std=token_init_std)
+        if self.token_embedding_2 is not None:
+            nn.init.normal_(self.token_embedding_2.weight, mean=0.0, std=token_init_std)
+        if self.character_embedding is not None:
+            nn.init.normal_(
+                self.character_embedding.weight,
+                mean=0.0,
+                std=token_init_std * self.char_init_scale,
+            )
+        if self.aux_embedding is not None:
+            nn.init.normal_(self.aux_embedding, mean=0.0, std=token_init_std)
+
+    def _apply_rotary(self, embeddings: Tensor) -> Tensor:
+        if self.rotary is None or self.rotary_dim == 0:
+            return embeddings
+        rotated = embeddings[..., : self.rotary_dim]
+        tail = embeddings[..., self.rotary_dim :]
+        seq_len = rotated.size(-2)
+        rotated = rotated.reshape(-1, 1, seq_len, self.rotary_dim)
+        cos, sin = self.rotary(seq_len, embeddings.device, embeddings.dtype)
+        rotated = apply_rotary_emb(rotated, cos, sin).reshape(*embeddings.shape[:-1], self.rotary_dim)
+        if tail.numel() == 0:
+            return rotated
+        return torch.cat((rotated, tail), dim=-1)
+
+    def _character_weight(self) -> Tensor:
+        if self.character_embedding is None:
+            raise RuntimeError("character embeddings are unavailable for this spelling type")
+        embeddings = self.character_embedding(self.vocab_character_table)
+        embeddings = self._apply_rotary(embeddings)
+        embeddings = embeddings * self.vocab_character_mask[..., None].to(dtype=embeddings.dtype)
+        embeddings = embeddings.sum(dim=-2)
+        if self.character_norm:
+            embeddings = F.layer_norm(embeddings.float(), (self.embedding_dim,)).to(dtype=embeddings.dtype)
+        if self.scale != 1.0:
+            embeddings = embeddings * self.scale
+        return embeddings
+
+    @property
+    def weight(self) -> Tensor:
+        if self.spelling_type == "double":
+            if self.token_embedding_2 is None:
+                raise RuntimeError("token_embedding_2 is required for SPELLING_BEE_TYPE=double")
+            embeddings = self.token_embedding_2.weight
+        elif self.spelling_type == "static_emb":
+            if self.aux_embedding is None:
+                raise RuntimeError("aux_embedding is required for SPELLING_BEE_TYPE=static_emb")
+            embeddings = self.aux_embedding.unsqueeze(0).expand(self.num_embeddings, -1).contiguous()
+        else:
+            embeddings = self._character_weight()
+        if self.token_embedding is not None:
+            embeddings = embeddings + self.token_embedding.weight
+        return embeddings
+
+    def forward(self, input_ids: Tensor) -> Tensor:
+        return F.embedding(input_ids, self.weight)
+
+
 class CausalSelfAttention(nn.Module):
     def __init__(
         self,
@@ -659,6 +809,9 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        embedding_type: str = "standard",
+        vocab: list[str] | None = None,
+        spelling_bee_config: dict[str, object] | None = None,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -666,7 +819,27 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
-        self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        if embedding_type == "standard":
+            self.tok_emb: nn.Module = nn.Embedding(vocab_size, model_dim)
+        elif embedding_type == "spelling_bee":
+            if vocab is None:
+                raise ValueError("vocab is required when EMBEDDING_TYPE=spelling_bee")
+            config = dict(spelling_bee_config or {})
+            self.tok_emb = SpellingBeeEmbedding(
+                num_tokens=vocab_size,
+                embedding_dim=model_dim,
+                vocab=vocab,
+                separate_token_embedding=bool(config.get("separate_token_embedding", True)),
+                max_characters=int(config.get("max_characters", 32)),
+                character_norm=bool(config.get("character_norm", True)),
+                char_init_scale=float(config.get("char_init_scale", 1.0)),
+                apply_rotary=bool(config.get("apply_rotary", True)),
+                scale=float(config.get("scale", 1.0)),
+                spelling_type=str(config.get("spelling_type", "full")),
+                rotary_base=rope_base,
+            )
+        else:
+            raise ValueError(f"unsupported EMBEDDING_TYPE={embedding_type}")
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -691,14 +864,18 @@ class GPT(nn.Module):
         self._init_weights()
 
     def _init_weights(self) -> None:
-        if self.tie_embeddings:
+        if isinstance(self.tok_emb, SpellingBeeEmbedding):
+            embed_init_std = self.tied_embed_init_std if self.tie_embeddings else 1.0 / math.sqrt(self.tok_emb.embedding_dim)
+            self.tok_emb.init_weights(embed_init_std)
+        elif self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
         for module in self.modules():
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        x = self.tok_emb(input_ids)
+        embed_weight = self.tok_emb.weight
+        x = F.embedding(input_ids, embed_weight)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
         skips: list[Tensor] = []
@@ -715,7 +892,7 @@ class GPT(nn.Module):
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
-            logits_proj = F.linear(x, self.tok_emb.weight)
+            logits_proj = F.linear(x, embed_weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
@@ -809,12 +986,15 @@ def main() -> None:
         raise ValueError(
             f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}"
         )
+    if args.embedding_type not in {"standard", "spelling_bee"}:
+        raise ValueError(f"unsupported EMBEDDING_TYPE={args.embedding_type}")
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
     val_tokens = load_validation_tokens(args.val_files, args.train_seq_len)
     base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
         sp, args.vocab_size, device
     )
+    vocab = [sp.id_to_piece(i) for i in range(args.vocab_size)] if args.embedding_type == "spelling_bee" else None
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
@@ -835,6 +1015,17 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        embedding_type=args.embedding_type,
+        vocab=vocab,
+        spelling_bee_config={
+            "separate_token_embedding": args.spelling_bee_separate_token_embedding,
+            "max_characters": args.spelling_bee_max_characters,
+            "character_norm": args.spelling_bee_character_norm,
+            "char_init_scale": args.spelling_bee_char_init_scale,
+            "apply_rotary": args.spelling_bee_apply_rotary,
+            "scale": args.spelling_bee_scale,
+            "spelling_type": args.spelling_bee_type,
+        },
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -862,11 +1053,17 @@ def main() -> None:
     if base_model.skip_weights.numel() > 0:
         scalar_params.append(base_model.skip_weights)
     token_lr = args.tied_embed_lr if args.tie_embeddings else args.embed_lr
+    embed_params = (
+        [base_model.tok_emb.weight]
+        if isinstance(base_model.tok_emb, nn.Embedding)
+        else [p for p in base_model.tok_emb.parameters() if p.requires_grad]
+    )
+    embed_use_fused = len({p.dtype for p in embed_params}) == 1
     optimizer_tok = torch.optim.Adam(
-        [{"params": [base_model.tok_emb.weight], "lr": token_lr, "base_lr": token_lr}],
+        [{"params": embed_params, "lr": token_lr, "base_lr": token_lr}],
         betas=(args.beta1, args.beta2),
         eps=args.adam_eps,
-        fused=True,
+        fused=embed_use_fused,
     )
     optimizer_muon = Muon(
         matrix_params,
@@ -897,6 +1094,14 @@ def main() -> None:
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(f"embedding_type:{args.embedding_type}")
+    if args.embedding_type == "spelling_bee":
+        log0(
+            f"spelling_bee:type:{args.spelling_bee_type} separate_token_embedding:{args.spelling_bee_separate_token_embedding} "
+            f"max_characters:{args.spelling_bee_max_characters} character_norm:{args.spelling_bee_character_norm} "
+            f"apply_rotary:{args.spelling_bee_apply_rotary} char_init_scale:{args.spelling_bee_char_init_scale} "
+            f"scale:{args.spelling_bee_scale}"
+        )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
