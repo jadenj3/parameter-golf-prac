@@ -789,10 +789,11 @@ class Block(nn.Module):
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
-        x = mix[0].view(1, 1, -1) * x + mix[1].view(1, 1, -1) * x0
+        mix_x, mix_x0 = mix.unbind(0)
+        x = mix_x * x + mix_x0 * x0
         attn_out = self.attn(self.attn_norm(x))
-        x = x + self.attn_scale.to(dtype=x.dtype).view(1, 1, -1) * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype).view(1, 1, -1) * self.mlp(self.mlp_norm(x))
+        x = x + self.attn_scale.to(dtype=x.dtype) * attn_out
+        x = x + self.mlp_scale.to(dtype=x.dtype) * self.mlp(self.mlp_norm(x))
         return x
 
 
@@ -887,7 +888,7 @@ class GPT(nn.Module):
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
-                x = x + self.skip_weights[i : i + 1].to(dtype=x.dtype).view(1, 1, -1) * skips.pop()
+                x = x + self.skip_weights[i].to(dtype=x.dtype) * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
@@ -1032,11 +1033,8 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compile_reason = "enabled"
     use_compile = args.compile_model
-    if args.embedding_type == "spelling_bee":
-        use_compile = False
-        compile_reason = "disabled_for_spelling_bee_backward_shape_bug"
+    compile_reason = "enabled" if use_compile else "disabled_by_env"
     compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True) if use_compile else base_model
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
