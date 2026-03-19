@@ -79,6 +79,7 @@ class Hyperparameters:
     spelling_bee_apply_rotary = bool(int(os.environ.get("SPELLING_BEE_APPLY_ROTARY", "1")))
     spelling_bee_scale = float(os.environ.get("SPELLING_BEE_SCALE", 1.0))
     spelling_bee_type = os.environ.get("SPELLING_BEE_TYPE", "full")
+    compile_model = bool(int(os.environ.get("COMPILE_MODEL", "1")))
 
     # Optimizer hyperparameters.
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -1031,7 +1032,12 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
+    compile_reason = "enabled"
+    use_compile = args.compile_model
+    if args.embedding_type == "spelling_bee":
+        use_compile = False
+        compile_reason = "disabled_for_spelling_bee_backward_shape_bug"
+    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True) if use_compile else base_model
     model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
     # Optimizer split:
@@ -1094,6 +1100,7 @@ def main() -> None:
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(f"compile_model:requested={args.compile_model} active={use_compile} reason:{compile_reason}")
     log0(f"embedding_type:{args.embedding_type}")
     if args.embedding_type == "spelling_bee":
         log0(
